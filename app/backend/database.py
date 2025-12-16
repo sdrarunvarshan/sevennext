@@ -12,7 +12,7 @@ def get_db_connection():
             user="root",
             password="",
             database="sevenext",
-            port=3306
+            port=3307
         )
     except Error as e:
         print(f"Database connection error: {e}")

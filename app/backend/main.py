@@ -1,22 +1,32 @@
 # main.py — CORRECTED VERSION
-
 import os
 import uuid
 import json  
-from fastapi import Request
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, status,Body
+from twilio.rest import Client
+import random
+from datetime import datetime, timedelta
+from fastapi import Request,FastAPI, HTTPException, Depends, UploadFile, File, Form, status,Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
 from jose import jwt, JWTError
 from datetime import datetime
 from database import get_db_connection
-from models import UserCreate, UserLogin, AddressCreate, B2CRegister
 from security import create_access_token, get_password_hash, verify_password
 from security import SECRET_KEY, ALGORITHM
 from pydantic import BaseModel
 from typing import Optional, List
 from pydantic import Field
-from models import UserCreate, UserLogin, AddressCreate, B2CRegister, OrderCreate      
+from models import UserCreate, UserLogin, AddressCreate, B2CRegister, OrderCreate , PhoneRequest, VerifyOtpRequest,normalize_phone   
+from dotenv import load_dotenv
+
+load_dotenv()
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_VERIFY_SERVICE_SID = "VA2b0a240ab58b4db3c500fec2f6ae344e"  # You need to create this in Twilio Console
+client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+otp_store = {}
+
 
 app = FastAPI(title="backendapi")
 
@@ -61,6 +71,107 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     
     return user["id"] # Return the user_id
+
+@app.post("/auth/send-verification")
+async def send_verification(payload: PhoneRequest):
+    phone = normalize_phone(payload.phone)  # 🔥 ADD THIS
+
+    otp = str(random.randint(100000, 999999))
+    otp_store[phone] = {
+        "otp": otp,
+        "expires_at": datetime.now() + timedelta(minutes=10),
+        "verified": False
+    }
+
+    client.messages.create(
+        body=f"Your verification code is: {otp}",
+        from_=os.getenv("TWILIO_PHONE_NUMBER"),
+        to=phone
+    )
+
+    return {"message": "OTP sent successfully"}
+
+
+@app.post("/auth/verify-otp")
+async def verify_otp(payload: VerifyOtpRequest):
+    phone = normalize_phone(payload.phone)  # 🔥 ADD THIS
+    otp = payload.otp
+
+    if phone not in otp_store:
+        raise HTTPException(400, "No OTP requested for this phone")
+
+    record = otp_store[phone]
+
+    if datetime.now() > record["expires_at"]:
+        del otp_store[phone]
+        raise HTTPException(400, "OTP expired")
+
+    if record["otp"] != otp:
+        raise HTTPException(400, "Invalid OTP")
+
+    record["verified"] = True
+    return {"message": "Phone verified successfully"}
+
+
+@app.post("/auth/forgot-password/request")
+async def forgot_password_request(phone: str = Body(...)):
+    """Send OTP for password reset (check if phone exists in DB)"""
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    # Check if phone exists in auth_users
+    cursor.execute("SELECT id FROM auth_users WHERE phone_number = %s", (phone,))
+    if not cursor.fetchone():
+        raise HTTPException(404, "Phone number not registered")
+    
+    # Send OTP (same logic as send_verification)
+    otp = str(random.randint(100000, 999999))
+    otp_store[f"reset_{phone}"] = {
+        "otp": otp,
+        "expires_at": datetime.now() + timedelta(minutes=10)
+    }
+    
+    message = client.messages.create(
+        body=f"Your password reset code is: {otp}",
+        from_="+1234567890",
+        to=phone
+    )
+    
+    return {"message": "Reset OTP sent", "sid": message.sid}
+
+@app.post("/auth/reset-password")
+async def reset_password(
+    phone: str = Body(...),
+    otp: str = Body(...),
+    new_password: str = Body(...)
+):
+    """Verify OTP and reset password"""
+    key = f"reset_{phone}"
+    if key not in otp_store:
+        raise HTTPException(400, "No reset request found")
+    
+    record = otp_store[key]
+    if datetime.now() > record["expires_at"]:
+        del otp_store[key]
+        raise HTTPException(400, "OTP expired")
+    
+    if record["otp"] != otp:
+        raise HTTPException(400, "Invalid OTP")
+    
+    # Update password in database
+    hashed_pw = get_password_hash(new_password[:72])
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE auth_users SET password_hash = %s WHERE phone_number = %s",
+        (hashed_pw, phone)
+    )
+    conn.commit()
+    
+    # Clean up OTP
+    del otp_store[key]
+    
+    return {"message": "Password reset successful"}    
 
 
 # ============================ AUTH ============================
@@ -144,7 +255,6 @@ async def login(form: UserLogin):
         conn.close()
 
 # ============================ B2C SIGNUP (Normal User) ============================
-# ============================ B2C SIGNUP (Normal User) ============================
 @app.post("/auth/register/b2c")
 async def register_b2c(payload: B2CRegister):
     # This is for regular customer signup. It uses the same main signup logic.
@@ -161,6 +271,14 @@ async def register_b2c(payload: B2CRegister):
         cursor.execute("SELECT id FROM auth_users WHERE email = %s", (payload.email,))
         if cursor.fetchone():
             raise HTTPException(status_code=400, detail="Email already registered")
+            
+        # Normalize phone number before OTP check
+        phone = normalize_phone(payload.phone_number)
+
+        otp_entry = otp_store.get(phone)
+        if not otp_entry or not otp_entry.get("verified"):
+            raise HTTPException(status_code=400, detail="Phone number not verified")
+   
 
         user_id = str(uuid.uuid4())
         truncated_pw = (payload.password or "")[:72]
@@ -171,7 +289,7 @@ async def register_b2c(payload: B2CRegister):
        INSERT INTO auth_users 
        (id, email, password_hash, full_name, phone_number, raw_user_meta_data)
         VALUES (%s, %s, %s, %s, %s, %s)
-       """, (user_id, payload.email, hashed_pw, payload.full_name, payload.phone_number, "{}"))
+       """, (user_id, payload.email, hashed_pw, payload.full_name, phone, "{}"))
 
         # Create address if provided
         address_id = None
@@ -193,9 +311,13 @@ async def register_b2c(payload: B2CRegister):
             INSERT INTO b2c_applications 
             (id, full_name, phone_number, email, address_id)
             VALUES (%s, %s, %s, %s, %s)
-        """, (user_id, payload.full_name, payload.phone_number, payload.email, address_id))
+        """, (user_id, payload.full_name, phone, payload.email, address_id))
         
         conn.commit()
+        
+        # Clean up OTP record after successful registration
+        otp_store.pop(phone, None)
+
         
         # Create token with all required claims
         token = create_access_token(
@@ -232,106 +354,131 @@ async def register_b2b(
 ):
     conn = None
     cursor = None
+
     try:
-        # Create user in auth_users table
-        user_id = str(uuid.uuid4())
-        hashed_pw = get_password_hash(password[:72])
-        
+        # ✅ Normalize phone FIRST
+        phone = normalize_phone(phone_number)
+
+        # ✅ OTP VERIFICATION FIRST (before DB writes)
+        otp_entry = otp_store.get(phone)
+        if not otp_entry or not otp_entry.get("verified"):
+            raise HTTPException(status_code=400, detail="Phone number not verified")
+
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # Check if email already exists in auth_users
+
+        # ✅ Check if email already exists
         cursor.execute("SELECT id FROM auth_users WHERE email = %s", (email,))
         if cursor.fetchone():
             raise HTTPException(status_code=400, detail="Email already registered")
-        
-        # Insert user into auth_users (no business_name here)
+
+        # ✅ Create user
+        user_id = str(uuid.uuid4())
+        hashed_pw = get_password_hash(password[:72])
+
         cursor.execute("""
             INSERT INTO auth_users 
             (id, email, password_hash, phone_number, raw_user_meta_data)
             VALUES (%s, %s, %s, %s, %s)
-        """, (user_id, email, hashed_pw, phone_number, "{}"))
-        
-        # Handle documents
+        """, (user_id, email, hashed_pw, phone, "{}"))
+
+        # ✅ Save documents
+        os.makedirs("uploads/b2b/gst", exist_ok=True)
+        os.makedirs("uploads/b2b/license", exist_ok=True)
+
         gst_filename = f"{uuid.uuid4().hex}_{os.path.basename(gst_certificate.filename)}"
         license_filename = f"{uuid.uuid4().hex}_{os.path.basename(business_license.filename)}"
+
         gst_path = os.path.join("uploads", "b2b", "gst", gst_filename)
         license_path = os.path.join("uploads", "b2b", "license", license_filename)
 
-        with open(gst_path, "wb") as f: 
+        with open(gst_path, "wb") as f:
             f.write(await gst_certificate.read())
-        with open(license_path, "wb") as f: 
+
+        with open(license_path, "wb") as f:
             f.write(await business_license.read())
 
-        # Handle address
+        # ✅ Address handling
         address_id = None
         if address:
-            try:
-                addr_obj = json.loads(address)
-            except json.JSONDecodeError:
-                addr_obj = None
+            addr_obj = json.loads(address)
 
-            if addr_obj and addr_obj.get("street"):
+            if addr_obj.get("street"):
                 address_id = str(uuid.uuid4())
                 cursor.execute("""
                     INSERT INTO addresses (id, street, city, postal_code, country, user_id)
                     VALUES (%s, %s, %s, %s, %s, %s)
-                """, (address_id, addr_obj.get("street"), addr_obj.get("city"), 
-                      addr_obj.get("postal_code"), addr_obj.get("country"), user_id))
-                
+                """, (
+                    address_id,
+                    addr_obj.get("street"),
+                    addr_obj.get("city"),
+                    addr_obj.get("postal_code"),
+                    addr_obj.get("country"),
+                    user_id
+                ))
+
                 cursor.execute("""
                     INSERT INTO user_addresses (id, user_id, address_id, name, is_default)
                     VALUES (%s, %s, %s, %s, %s)
                 """, (str(uuid.uuid4()), user_id, address_id, "Business Address", True))
 
-        # Insert B2B application (business_name is stored here)
+        # ✅ Insert B2B application
         b2b_app_id = str(uuid.uuid4())
-        current_time = datetime.now()
-        
+        now = datetime.now()
+
         cursor.execute("""
             INSERT INTO b2b_applications
             (id, user_id, business_name, gstin, pan, email, phone_number,
              gst_certificate_url, business_license_url, status, created_at, address_id)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            b2b_app_id, user_id, business_name, gstin, pan, email, phone_number, 
-            gst_path, license_path, 'pending_approval', current_time, address_id
+            b2b_app_id,
+            user_id,
+            business_name,
+            gstin,
+            pan,
+            email,
+            phone,
+            gst_path,
+            license_path,
+            "pending_approval",
+            now,
+            address_id
         ))
-        
+
         conn.commit()
 
-        # Create token with B2B user_type
+        # ✅ Remove OTP after success
+        otp_store.pop(phone, None)
+
+        # ✅ Create token
         token = create_access_token(
-            {"sub": email, "user_id": user_id, "user_type": "b2b"}, 
+            {"sub": email},
             user_id=user_id,
             user_type="b2b"
         )
 
         return {
-            "message": "B2B Application Submitted Successfully!", 
+            "message": "B2B Application Submitted Successfully",
             "application_id": b2b_app_id,
-            "user_id": user_id, 
-            "address_id": address_id,
-            "access_token": token, 
+            "user_id": user_id,
+            "access_token": token,
             "token_type": "bearer"
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        if conn: 
+        if conn:
             conn.rollback()
-        # Log the error for debugging
-        print(f"Error in B2B registration: {str(e)}")
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Internal Server Error: {str(e)}"
-        )
+        print("🔥 B2B REGISTER ERROR:", repr(e))
+        raise HTTPException(status_code=500, detail="B2B registration failed")
     finally:
-        if cursor: 
+        if cursor:
             cursor.close()
-        if conn: 
+        if conn:
             conn.close()
+
 # ============================ ADDRESS CRUD ============================
 
 @app.post("/users/addresses")

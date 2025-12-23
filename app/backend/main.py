@@ -2,8 +2,11 @@
 import os
 import uuid
 import json  
+import razorpay
 from twilio.rest import Client
 import random
+import hmac
+import hashlib
 from datetime import datetime, timedelta
 from fastapi import Request,FastAPI, HTTPException, Depends, UploadFile, File, Form, status,Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,14 +19,26 @@ from security import SECRET_KEY, ALGORITHM
 from pydantic import BaseModel
 from typing import Optional, List
 from pydantic import Field
-from models import UserCreate, UserLogin, AddressCreate, B2CRegister, OrderCreate , PhoneRequest, VerifyOtpRequest,normalize_phone   
+from models import UserCreate, UserLogin, AddressCreate, B2CRegister, OrderCreate , PhoneRequest, VerifyOtpRequest,normalize_phone, ResetPasswordRequest ,CreatePaymentRequest,VerifyPaymentRequest,ReturnCreate  
 from dotenv import load_dotenv
+from dotenv import load_dotenv
+
+
+
+
 
 load_dotenv()
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_VERIFY_SERVICE_SID = "VA2b0a240ab58b4db3c500fec2f6ae344e"  # You need to create this in Twilio Console
 client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# Initialize RazorPay client
+RAZORPAY_KEY_ID = os.getenv("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = os.getenv("RAZORPAY_KEY_SECRET")
+
+razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+
 
 otp_store = {}
 
@@ -94,27 +109,38 @@ async def send_verification(payload: PhoneRequest):
 
 @app.post("/auth/verify-otp")
 async def verify_otp(payload: VerifyOtpRequest):
-    phone = normalize_phone(payload.phone)  # 🔥 ADD THIS
+    phone = normalize_phone(payload.phone)   # ✅ keep normalization
     otp = payload.otp
 
-    if phone not in otp_store:
+    # ✅ Decide OTP key safely
+    if payload.type == "reset":
+        key = f"reset_{phone}"
+    else:
+        key = phone  # signup / b2b signup
+
+    if key not in otp_store:
         raise HTTPException(400, "No OTP requested for this phone")
 
-    record = otp_store[phone]
+    record = otp_store[key]
 
     if datetime.now() > record["expires_at"]:
-        del otp_store[phone]
+        del otp_store[key]
         raise HTTPException(400, "OTP expired")
 
     if record["otp"] != otp:
         raise HTTPException(400, "Invalid OTP")
 
     record["verified"] = True
-    return {"message": "Phone verified successfully"}
+    return {
+        "success": True,
+        "message": "Phone verified successfully"
+    }
+
 
 
 @app.post("/auth/forgot-password/request")
-async def forgot_password_request(phone: str = Body(...)):
+async def forgot_password_request(payload: PhoneRequest):
+    phone = normalize_phone(payload.phone)
     """Send OTP for password reset (check if phone exists in DB)"""
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
@@ -133,45 +159,59 @@ async def forgot_password_request(phone: str = Body(...)):
     
     message = client.messages.create(
         body=f"Your password reset code is: {otp}",
-        from_="+1234567890",
+        from_=os.getenv("TWILIO_PHONE_NUMBER"),
         to=phone
     )
     
-    return {"message": "Reset OTP sent", "sid": message.sid}
+    return {"success":  True, "message": "Reset OTP sent"}
 
 @app.post("/auth/reset-password")
-async def reset_password(
-    phone: str = Body(...),
-    otp: str = Body(...),
-    new_password: str = Body(...)
-):
-    """Verify OTP and reset password"""
+async def reset_password(payload: ResetPasswordRequest):
+    phone = normalize_phone(payload.phone)
+    email = payload.email.lower()
+    otp = payload.otp
+    new_password = payload.new_password
+
     key = f"reset_{phone}"
+
     if key not in otp_store:
         raise HTTPException(400, "No reset request found")
-    
+
     record = otp_store[key]
+
     if datetime.now() > record["expires_at"]:
         del otp_store[key]
         raise HTTPException(400, "OTP expired")
-    
+
     if record["otp"] != otp:
         raise HTTPException(400, "Invalid OTP")
-    
-    # Update password in database
-    hashed_pw = get_password_hash(new_password[:72])
+
     conn = get_db_connection()
-    cursor = conn.cursor()
+    cursor = conn.cursor(dictionary=True)
+
     cursor.execute(
-        "UPDATE auth_users SET password_hash = %s WHERE phone_number = %s",
-        (hashed_pw, phone)
+        "SELECT id FROM auth_users WHERE email = %s AND phone_number = %s",
+        (email, phone)
+    )
+    user = cursor.fetchone()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="No account found for this email and phone number"
+        )
+
+    hashed_pw = get_password_hash(new_password[:72])
+
+    cursor.execute(
+        "UPDATE auth_users SET password_hash = %s WHERE id = %s",
+        (hashed_pw, user["id"])
     )
     conn.commit()
-    
-    # Clean up OTP
+
     del otp_store[key]
-    
-    return {"message": "Password reset successful"}    
+
+    return {"success": True, "message": "Password reset successful"}
 
 
 # ============================ AUTH ============================
@@ -1048,188 +1088,6 @@ async def get_product(product_id: str, user_type: str = "b2c"):
         cursor.close()
         conn.close()
 
-# ============================ PRODUCT SECTIONS ============================
-
-@app.get("/products/section/new_arrivals")
-async def get_new_arrivals(
-    limit: int = 10,
-    user_type: str = "b2c"
-):
-    """
-    Get newly added products.
-    """
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    
-    try:
-        query = """
-            SELECT 
-                id, name, category, description, status, stock, image,
-                created_at, updated_at,
-                b2c_price, b2b_price, 
-                b2c_active_offer, b2b_active_offer,
-                b2c_offer_price, b2b_offer_price,
-                b2c_discount, b2b_discount,
-                b2c_offer_start_date, b2c_offer_end_date,
-                b2b_offer_start_date, b2b_offer_end_date,
-                compare_at_price
-            FROM products 
-            WHERE status = 'Published'
-            ORDER BY created_at DESC
-            LIMIT %s
-        """
-        
-        cursor.execute(query, (limit,))
-        products = cursor.fetchall()
-        
-        # Get review counts and ratings
-        current_time = datetime.now()
-        for product in products:
-            cursor.execute("""
-                SELECT 
-                    COUNT(*) as review_count,
-                    AVG(rating) as avg_rating
-                FROM product_reviews 
-                WHERE product_id = %s
-            """, (product["id"],))
-            review_stats = cursor.fetchone()
-            
-            product["reviews"] = review_stats["review_count"] if review_stats else 0
-            product["rating"] = round(review_stats["avg_rating"], 2) if review_stats and review_stats["avg_rating"] else 0
-            
-            if user_type == "b2c":
-                # Check if offer is active
-                is_offer_active = (
-                    product["b2c_active_offer"] and 
-                    product["b2c_offer_price"] > 0 and
-                    (product["b2c_offer_start_date"] is None or product["b2c_offer_start_date"] <= current_time) and
-                    (product["b2c_offer_end_date"] is None or product["b2c_offer_end_date"] >= current_time)
-                )
-                
-                if is_offer_active:
-                    product["current_price"] = product["b2c_offer_price"]
-                else:
-                    product["current_price"] = product["b2c_price"]
-            else:  # b2b
-                # Check if offer is active
-                is_offer_active = (
-                    product["b2b_active_offer"] and 
-                    product["b2b_offer_price"] > 0 and
-                    (product["b2b_offer_start_date"] is None or product["b2b_offer_start_date"] <= current_time) and
-                    (product["b2b_offer_end_date"] is None or product["b2b_offer_end_date"] >= current_time)
-                )
-                
-                if is_offer_active:
-                    product["current_price"] = product["b2b_offer_price"]
-                else:
-                    product["current_price"] = product["b2b_price"]
-        
-        return {"section": "new_arrivals", "products": products}
-    
-    finally:
-        cursor.close()
-        conn.close()
-
-@app.get("/products/section/on_sale")
-async def get_on_sale_products(
-    limit: int = 10,
-    user_type: str = "b2c"
-):
-    """
-    Get products that are currently on sale.
-    """
-    conn = get_db_connection()
-    cursor = conn.cursor(dictionary=True)
-    
-    try:
-        current_time = datetime.now()
-        
-        if user_type == "b2c":
-            query = """
-                SELECT 
-                    id, name, category, description, status, stock, image,
-                    created_at, updated_at,
-                    b2c_price, b2b_price, 
-                    b2c_active_offer, b2b_active_offer,
-                    b2c_offer_price, b2b_offer_price,
-                    b2c_discount, b2b_discount,
-                    b2c_offer_start_date, b2c_offer_end_date,
-                    b2b_offer_start_date, b2b_offer_end_date,
-                    compare_at_price
-                FROM products 
-                WHERE status = 'Published' 
-                AND b2c_active_offer = 1
-                AND b2c_offer_price > 0
-                AND (b2c_offer_start_date IS NULL OR b2c_offer_start_date <= %s)
-                AND (b2c_offer_end_date IS NULL OR b2c_offer_end_date >= %s)
-                ORDER BY (b2c_price - b2c_offer_price) DESC
-                LIMIT %s
-            """
-        else:  # b2b
-            query = """
-                SELECT 
-                    id, name, category, description, status, stock, image,
-                    created_at, updated_at,
-                    b2c_price, b2b_price, 
-                    b2c_active_offer, b2b_active_offer,
-                    b2c_offer_price, b2b_offer_price,
-                    b2c_discount, b2b_discount,
-                    b2c_offer_start_date, b2c_offer_end_date,
-                    b2b_offer_start_date, b2b_offer_end_date,
-                    compare_at_price
-                FROM products 
-                WHERE status = 'Published' 
-                AND b2b_active_offer = 1
-                AND b2b_offer_price > 0
-                AND (b2b_offer_start_date IS NULL OR b2b_offer_start_date <= %s)
-                AND (b2b_offer_end_date IS NULL OR b2b_offer_end_date >= %s)
-                ORDER BY (b2b_price - b2b_offer_price) DESC
-                LIMIT %s
-            """
-        
-        cursor.execute(query, (current_time, current_time, limit))
-        products = cursor.fetchall()
-        
-        # Get review counts and format response
-        for product in products:
-            cursor.execute("""
-                SELECT 
-                    COUNT(*) as review_count,
-                    AVG(rating) as avg_rating
-                FROM product_reviews 
-                WHERE product_id = %s
-            """, (product["id"],))
-            review_stats = cursor.fetchone()
-            
-            product["reviews"] = review_stats["review_count"] if review_stats else 0
-            product["rating"] = round(review_stats["avg_rating"], 2) if review_stats and review_stats["avg_rating"] else 0
-            
-            # Format response
-            if user_type == "b2c":
-                product["current_price"] = product["b2c_offer_price"]
-                product["original_price"] = product["b2c_price"]
-                if product["b2c_price"] > 0:
-                    product["discount_percentage"] = round(
-                        (product["b2c_price"] - product["b2c_offer_price"]) / product["b2c_price"] * 100, 2
-                    )
-                else:
-                    product["discount_percentage"] = 0
-            else:
-                product["current_price"] = product["b2b_offer_price"]
-                product["original_price"] = product["b2b_price"]
-                if product["b2b_price"] > 0:
-                    product["discount_percentage"] = round(
-                        (product["b2b_price"] - product["b2b_offer_price"]) / product["b2b_price"] * 100, 2
-                    )
-                else:
-                    product["discount_percentage"] = 0
-        
-        return {"section": "on_sale", "products": products}
-    
-    finally:
-        cursor.close()
-        conn.close()
-
 # ============================ RATING & REVIEW ENDPOINTS ============================
 
 class ReviewCreate(BaseModel):
@@ -1480,8 +1338,8 @@ async def place_order_from_app(order_data: OrderCreate, current_user_id: str = D
 
         cursor.execute("""
             INSERT INTO orders (
-                id, customer, email, amount, items_count, type, status, payment_status, date, address,items
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s)
+                id, customer, email, amount, items_count, type, status, payment_status,  payment_method,date, address,items
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,%s,%s)
         """, (
             order_data.order_id,
             current_user_id, # Use current_user_id (from auth_users.id) as the customer reference
@@ -1489,8 +1347,9 @@ async def place_order_from_app(order_data: OrderCreate, current_user_id: str = D
             order_data.total_price,
             len(order_data.products),
             actual_user_type,
-            order_data.order_status, # e.g., 'processing'
-            "pending", # Default payment status until payment is confirmed
+            order_data.order_status,
+            order_data.payment_status,
+            order_data.payment_method,
             datetime.strptime(order_data.placed_on, '%d/%m/%Y').strftime('%Y-%m-%d %H:%M:%S'),
             order_data.customer_address_text
             ,items_json_string
@@ -1501,7 +1360,8 @@ async def place_order_from_app(order_data: OrderCreate, current_user_id: str = D
         return {
             "message": "Order saved successfully",
             "order_id": order_data.order_id,
-            "user_id_saved_as_customer": current_user_id
+            "user_id_saved_as_customer": current_user_id,
+            "payment_status": order_data.payment_status
         }
     except Exception as e:
         conn.rollback()
@@ -1550,6 +1410,7 @@ async def get_orders_by_user(
                 'type': order['type'],
                 'status': order['status'],
                 'payment_status': order['payment_status'],
+                'payment_method': order['payment_method'],
                 'date': order['date'].strftime('%Y-%m-%d') if order['date'] else '',
                 'address': order['address'],
                 'items': items
@@ -1567,3 +1428,274 @@ async def get_orders_by_user(
     finally:
         cursor.close()
         conn.close()
+# ============================ RETURN REQUESTS ============================
+@app.post("/returns/create")
+async def create_return_request(
+    payload: ReturnCreate,
+    current_user: str = Depends(get_current_user)
+):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    try:
+        images_json = json.dumps(payload.images or [])
+        cursor.execute(
+            "SELECT email FROM auth_users WHERE id = %s",
+            (current_user,)
+        )
+        user = cursor.fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        email = user[0]
+
+        # INSERT without specifying 'id' → auto-increment
+        cursor.execute("""
+            INSERT INTO returns (
+                order_id,
+                customer,
+                email,
+                reason,
+                details,
+                payment_method,
+                refund_amount,
+                images
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            payload.order_id,
+            current_user,
+            email,
+            payload.reason,
+            payload.details or "",
+            payload.payment_method,
+            payload.refund_amount,
+            images_json
+        ))
+
+        # Get the auto-generated id
+        cursor.execute("SELECT LAST_INSERT_ID()")
+        new_return_id = cursor.fetchone()[0]
+
+        conn.commit()
+
+        return {
+            "success": True,
+            "message": "Return request created",
+            "return_id": new_return_id  # now correct auto-incremented ID
+        }
+
+    except Exception as e:
+        conn.rollback()
+        print("RETURN CREATE ERROR:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.get("/returns/user")
+async def get_user_returns(
+    current_user=Depends(get_current_user)
+):
+    if not isinstance(current_user, dict):
+        raise HTTPException(status_code=401, detail="Invalid user data")
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        cursor.execute("""
+            SELECT *
+            FROM returns
+            WHERE customer = %s
+            ORDER BY created_at DESC
+        """, (current_user))
+
+        rows = cursor.fetchall()
+
+        for r in rows:
+            r["images"] = json.loads(r["images"] or "[]")
+            r["created_at"] = r["created_at"].strftime('%Y-%m-%d')
+
+        return {"success": True, "returns": rows}
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+@app.get("/returns/order/{order_id}")
+async def get_returns_by_order(
+    order_id: str,
+   current_user: str = Depends(get_current_user) 
+):
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    try:
+        cursor.execute("""
+            SELECT *
+            FROM returns
+            WHERE order_id = %s
+              AND customer = %s
+            ORDER BY created_at DESC
+        """, (order_id, current_user))
+
+        data = cursor.fetchall()
+
+        for r in data:
+            r["images"] = json.loads(r["images"] or "[]")
+            r["created_at"] = r["created_at"].strftime('%Y-%m-%d')
+
+        return {
+            "success": True,
+            "returns": data
+        }
+
+    except Exception as e:
+        print("RETURN ORDER FETCH ERROR:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        cursor.close()
+        conn.close()
+
+
+# ============================ RAZORPAY PAYMENT INTEGRATION ============================
+
+@app.post("/payment/create-order")
+async def create_razorpay_order(
+    payment_data: CreatePaymentRequest,
+    current_user_id: str = Depends(get_current_user)
+):
+    """
+    Create a RazorPay order for payment
+    """
+    try:
+        # Convert amount to paise (RazorPay expects amount in smallest currency unit)
+        amount_in_paise = int(payment_data.amount * 100)
+        
+        # Create receipt if not provided
+        receipt = payment_data.receipt or f"receipt_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        
+        # Create RazorPay order
+        razorpay_order = razorpay_client.order.create({
+            'amount': amount_in_paise,
+            'currency': payment_data.currency,
+            'receipt': receipt,
+            'notes': payment_data.notes or {},
+            'payment_capture': 1  # Auto-capture payment
+        })
+        
+        return {
+            "success": True,
+            "order_id": razorpay_order['id'],
+            "amount": razorpay_order['amount'],
+            "currency": razorpay_order['currency'],
+            "key": RAZORPAY_KEY_ID,
+            "notes": razorpay_order.get('notes', {})
+        }
+        
+    except Exception as e:
+        print(f"Error creating RazorPay order: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create payment order: {str(e)}")
+
+@app.post("/payment/verify")
+async def verify_payment(payload: VerifyPaymentRequest):
+    try:
+        # Step 1: Verify Razorpay signature
+        generated_signature = hmac.new(
+            RAZORPAY_KEY_SECRET.encode(),
+            f"{payload.razorpay_order_id}|{payload.razorpay_payment_id}".encode(),
+            hashlib.sha256
+        ).hexdigest()
+
+        if generated_signature != payload.razorpay_signature:
+            raise HTTPException(status_code=400, detail="Invalid payment signature")
+        payment = razorpay_client.payment.fetch(payload.razorpay_payment_id)
+        actual_payment_method = payment.get("method")  # card, netbanking, upi, wallet
+    
+
+        # ✅ Step 2: Payment is verified
+        # ❌ DO NOT CHECK DB HERE
+
+        return {
+            "success": True,
+            "message": "Payment verified successfully",
+            "order_id": payload.order_id,
+            "razorpay_payment_id": payload.razorpay_payment_id,
+            "payment_method": actual_payment_method
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print("Error verifying payment:", e)
+        raise HTTPException(status_code=500, detail="Payment verification failed")
+
+
+@app.get("/payment/order-status/{order_id}")
+async def get_payment_status(order_id: str):
+    """
+    Check payment status for an order
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    
+    try:
+        cursor.execute("""
+            SELECT id, payment_status,
+                   amount, email, date
+            FROM orders 
+            WHERE id = %s
+        """, (order_id,))
+        
+        order = cursor.fetchone()
+        
+        if not order:
+            raise HTTPException(status_code=404, detail="Order not found")
+        
+        return {
+            "success": True,
+            "order_id": order['id'],
+            "payment_status": order['payment_status'],
+            "amount": float(order['amount']) if order['amount'] else 0.0,
+            "email": order['email'],
+            "date": order['date'].strftime('%Y-%m-%d %H:%M:%S') if order['date'] else None
+        }
+        
+    except Exception as e:
+        print(f"Error fetching payment status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch payment status: {str(e)}")
+    finally:
+        cursor.close()
+        conn.close()
+
+@app.post("/payment/create-for-order/{order_id}")
+async def create_payment_for_order(
+    order_id: str,
+    payload: CreatePaymentRequest
+):
+    try:
+        amount_in_paise = int(payload.amount * 100)
+
+        razorpay_order = razorpay_client.order.create({
+            "amount": amount_in_paise,
+            "currency": "INR",
+            "receipt": f"receipt_{order_id}",
+            "payment_capture": 1
+        })
+
+        return {
+            "success": True,
+            "razorpay_order_id": razorpay_order["id"],
+            "amount": razorpay_order["amount"],
+            "currency": razorpay_order["currency"],
+            "key": RAZORPAY_KEY_ID
+        }
+
+    except Exception as e:
+        print("Error creating Razorpay order:", e)
+        raise HTTPException(status_code=500, detail="Payment creation failed")
+

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr ,Field
 from typing import Optional , List
 
 class Token(BaseModel):
@@ -31,8 +31,15 @@ def normalize_phone(phone: str) -> str:
 
 class VerifyOtpRequest(BaseModel):
     phone: str
-    otp: str    
-    
+    otp: str  
+    type: Optional[str] = None  # Add this field  
+
+class ResetPasswordRequest(BaseModel):
+    email: EmailStr
+    phone: str
+    otp: str
+    new_password: str
+        
 class AddressCreate(BaseModel):
     street: str
     city: str
@@ -89,4 +96,26 @@ class OrderCreate(BaseModel):
     customer_email: str
     customer_address_text: str
     user_type: str = "b2c" 
-   
+    payment_status: str
+    payment_method: str
+    
+
+class ReturnCreate(BaseModel):
+    order_id: str
+    reason: str
+    details: Optional[str] = ""
+    payment_method: Optional[str] = None
+    refund_amount: float
+    images: List[str] = Field(default_factory=list)
+
+class CreatePaymentRequest(BaseModel):
+    amount: float
+    currency: str = "INR"
+    receipt: str = None
+    notes: dict = None
+
+class VerifyPaymentRequest(BaseModel):
+    razorpay_order_id: str
+    razorpay_payment_id: str
+    razorpay_signature: str
+    order_id: str  # Your internal order ID    

@@ -1,5 +1,6 @@
 from pydantic import BaseModel, EmailStr ,Field
 from typing import Optional , List
+from fastapi import UploadFile, File  # ← IMPORTANT: for file uploads
 
 class Token(BaseModel):
     access_token: str
@@ -41,9 +42,10 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
         
 class AddressCreate(BaseModel):
-    street: str
+    address: str
     city: str
-    postal_code: Optional[int] = None
+    state:str
+    pincode: Optional[int] = None
     state: Optional[str] = None
     country: str
     name: str = "Home"
@@ -60,9 +62,9 @@ class B2BApplicationCreate(BaseModel):
 
 
 class AddressPayload(BaseModel):
-    street: str
+    address: str
     city: str
-    postal_code: Optional[int] = None
+    pincode: Optional[int] = None
     state: Optional[str] = None
     country: Optional[str] = ""
     name: Optional[str] = "Home"
@@ -76,37 +78,52 @@ class B2CRegister(BaseModel):
     phone_number: Optional[str] = None
     raw_user_meta_data: Optional[dict] = None
     address: Optional[AddressPayload] = None
+    
 class OrderedProductBase(BaseModel):
+    order_item_id: Optional[int] = None 
     name: str
+    price: float
     imageUrl: str
     quantity: int
     colorHex: str
+    hsnCode: str  
+    weightKg: Optional[float] = None  # Make Optional and float
+    lengthCm: Optional[float] = None  # Make Optional and float
+    breadthCm: Optional[float] = None  # Make Optional and float
+    heightCm: Optional[float] = None  # Make Optional and float
+    
 
 class OrderCreate(BaseModel):
     order_id: str # Unique ID from Flutter (e.g., timestamp)
     placed_on: str # Date string
     order_status: str # e.g., 'processing'
     processing_status: str
+    customer_name: str
     packed_status: str
     shipped_status: str
     delivered_status: str
     products: List[OrderedProductBase]
     total_price: float
-    shipping_fee: float
+    shipping_fee: float  
+    state_gst_amount: float
+    central_gst_amount: float
+    sgst_percentage: float = 0.0 
+    cgst_percentage: float = 0.0
     customer_email: str
+    phone: str
     customer_address_text: str
     user_type: str = "b2c" 
     payment_status: str
     payment_method: str
-    
+    hsn: Optional[str] = ""  # Add this
+    city: Optional[str] = None        # 🔥 ADD
+    state: Optional[str] = None 
+    pincode: Optional[int] = None 
+    weight: Optional[float] = 0  # Add this
+    height: Optional[float] = 0  # Add this
+    length: Optional[float] = 0  # Add this
+    breadth: Optional[float] = 0  # Add this
 
-class ReturnCreate(BaseModel):
-    order_id: str
-    reason: str
-    details: Optional[str] = ""
-    payment_method: Optional[str] = None
-    refund_amount: float
-    images: List[str] = Field(default_factory=list)
 
 class CreatePaymentRequest(BaseModel):
     amount: float

@@ -19,7 +19,7 @@ def get_db_connection():
             # Your PostgreSQL credentials
             user="postgres",
             password="12345",
-            database="sevennxt",
+            database="sevenext",
             port=5432,
             
             # Optional: Prevents the app from hanging if the network is down

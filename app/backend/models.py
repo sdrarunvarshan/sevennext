@@ -97,11 +97,7 @@ class OrderCreate(BaseModel):
     order_id: str # Unique ID from Flutter (e.g., timestamp)
     placed_on: str # Date string
     order_status: str # e.g., 'processing'
-    processing_status: str
     customer_name: str
-    packed_status: str
-    shipped_status: str
-    delivered_status: str
     products: List[OrderedProductBase]
     total_price: float
     shipping_fee: float  

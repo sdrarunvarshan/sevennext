@@ -490,12 +490,13 @@ async def register_b2b(
             if addr_obj.get("address"):
                 address_id = str(uuid.uuid4())
                 cursor.execute("""
-                    INSERT INTO addresses (id, address, city, pincode, country, user_id)
-                    VALUES (%s, %s, %s, %s, %s, %s)
+                    INSERT INTO addresses (id, address, city,state, pincode, country, user_id)
+                    VALUES (%s, %s, %s, %s, %s, %s,%s)
                 """, (
                     address_id,
                     addr_obj.get("address"),
                     addr_obj.get("city"),
+                    addr_obj.get("state"),
                     addr_obj.get("pincode"),
                     addr_obj.get("country"),
                     user_id
